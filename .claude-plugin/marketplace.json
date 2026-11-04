@@ -1,0 +1,12 @@
+{
+  "name": "claude-buddy",
+  "owner": { "name": "gabrielbeeton" },
+  "description": "Buddy, a little companion for Claude Code that lives in the corner of your Mac.",
+  "plugins": [
+    {
+      "name": "buddy",
+      "source": "./",
+      "description": "The orange Claude creature in the corner of your Mac: it shows what Claude is doing, chats with you, and can look at your screen."
+    }
+  ]
+}
