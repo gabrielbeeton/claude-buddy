@@ -1,8 +1,10 @@
 {
   "name": "buddy",
-  "version": "0.2.0",
-  "description": "A little Claude Code companion: the orange Claude creature in the corner of your Mac. It shows what Claude is doing, chats with you, and can look at your screen.",
-  "author": { "name": "gabrielbeeton" },
+  "version": "0.3.0",
+  "description": "A little Claude Code companion: the orange Claude creature in the corner of your screen, on Mac and Windows. It shows what Claude is doing, chats with you, and can look at your screen.",
+  "author": {
+    "name": "gabrielbeeton"
+  },
   "repository": "https://github.com/gabrielbeeton/claude-buddy",
   "types": "./types/index.d.ts"
 }
