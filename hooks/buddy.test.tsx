@@ -14,6 +14,10 @@ const PANE = {
   },
 } as const
 
+// The engine spells file paths for the computer the tests run on, so a Mac path looks
+// different on a Windows PC and a Windows path looks different on a Mac: compare by the end.
+const isPath = (path: string, end: string) => path.replace(/\\/g, '/').endsWith(end)
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function engine(on: any) {
   on('command.register', () => ({ value: { command: 'buddy' } }))
@@ -58,7 +62,7 @@ test('the desktop pet gets a reply, and sees what Claude is doing', async ($, on
     return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('fs.list', (_: unknown, e: { path: string }) => {
-    if (e.path.endsWith('/inbox') && isQueued) {
+    if (isPath(e.path, '/Users/test/.claude/buddy/inbox') && isQueued) {
       isQueued = false
       return { value: [{ name: 'req-1.json', kind: 'file', size: 10, mtimeMs: 0, isLink: false }] }
     }
@@ -82,11 +86,11 @@ test('the desktop pet gets a reply, and sees what Claude is doing', async ($, on
   await clock.advance(2500)
 
   const root = '/Users/test/.claude/buddy'
-  const reply = writes.find(w => w.path === `${root}/outbox/req-1.tmp`)
+  const reply = writes.find(w => isPath(w.path, `${root}/outbox/req-1.tmp`))
   expect(reply && JSON.parse(reply.text).text).toBe('Hello friend!')
   expect(runs).toContainEqual(['mv', `${root}/inbox/req-1.json`, `${root}/inbox/req-1.sess-1.claimed`])
   expect(runs).toContainEqual(['mv', '-f', `${root}/outbox/req-1.tmp`, `${root}/outbox/req-1.json`])
-  const statuses = writes.filter(w => w.path === `${root}/sessions/sess-1.json`)
+  const statuses = writes.filter(w => isPath(w.path, `${root}/sessions/sess-1.json`))
   expect(statuses.length).toBeGreaterThan(0)
   expect(JSON.parse(statuses[statuses.length - 1]!.text).activity).toBe('Editing app.ts')
 })
@@ -95,8 +99,6 @@ const ranFine = { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false,
 const WINDOWS = { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\test', LOCALAPPDATA: 'C:\\Users\\test\\AppData\\Local' }
 const WINDOWS_ROOT = 'C:/Users/test/.claude/buddy'
 const WINDOWS_ROOT_NATIVE = 'C:\\Users\\test\\.claude\\buddy'
-// A Windows path reads as relative on another computer's engine, so compare by the end.
-const isPath = (path: string, end: string) => path.replace(/\\/g, '/').endsWith(end)
 
 test('on Windows the pet gets a reply through Windows paths and tools, never mv or rm', async ($, on) => {
   engine(on)
@@ -181,7 +183,7 @@ test('/buddy on a Mac still opens Buddy.app the way it did', async ($, on) => {
   on('session.id', () => ({ value: 'sess-1' }))
   on('fs.write', () => ({ value: undefined }))
   on('fs.list', () => ({ value: [] }))
-  on('fs.exists', (_: unknown, e: { path: string }) => ({ value: e.path === '/Users/test/Applications/Buddy.app' }))
+  on('fs.exists', (_: unknown, e: { path: string }) => ({ value: isPath(e.path, '/Users/test/Applications/Buddy.app') }))
   on('process.run', (_: unknown, e: { argv: readonly string[] }) => {
     runs.push([...e.argv])
     return { value: ranFine }

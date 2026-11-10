@@ -95,7 +95,7 @@ namespace Buddy
     // from the app you are working in.
     class LayeredForm : Form
     {
-        public Size PixelSize;
+        public Size PixelSize { get; set; }
         public byte Alpha = 255;
 
         public LayeredForm(string title, Size size)
