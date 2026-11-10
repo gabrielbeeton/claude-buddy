@@ -136,7 +136,7 @@ const allowedShots = new Set<string>()
 const waiting = new Map<string, (answer: string) => void>()
 const finished = new Map<string, string>()
 
-const base = (p: unknown) => (typeof p === 'string' ? p.split('/').pop() ?? p : '')
+const base = (p: unknown) => (typeof p === 'string' ? p.split(/[\\/]/).pop() ?? p : '')
 const clip = (s: string, n = 60) => (s.length > n ? s.slice(0, n - 1) + '…' : s)
 
 function describe(tool: string, input: unknown): string {
@@ -170,15 +170,18 @@ function describe(tool: string, input: unknown): string {
 
 // ------------------------------------------------------- the desktop bridge
 //
-// The desktop app (Buddy.app) and this mod share ~/.claude/buddy:
+// The desktop app (Buddy.app on a Mac, Buddy.exe on Windows) and this mod share
+// .claude/buddy in the person's home folder:
 //   sessions/<sid>.json  this session's status, rewritten every few seconds
 //   inbox/<id>.json      what the person said to the desktop pet
 //   outbox/<id>.json     Buddy's reply
 //   shots/<id>.png       a screenshot the app took for a "look" request
 //   quit                 asks the app to quit (/buddy bye)
 
+let isWindows = false
 let home = ''
 let root = ''
+let desktopApp = ''
 let sid = ''
 let ticker: ReturnType<Engine['clock']['every']> | undefined
 let ticks = 0
@@ -189,11 +192,46 @@ const SAFE_ID = /^[A-Za-z0-9-]{1,80}$/
 
 type DeskRequest = { id?: unknown; kind?: unknown; text?: unknown; image?: unknown; history?: unknown }
 
+// Finds this computer's folders. Windows keeps them under USERPROFILE and
+// LOCALAPPDATA; forward slashes work for every file call there, so paths stay in
+// one spelling here and `native` turns them round for Windows' own tools.
+async function locate($: Engine) {
+  isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  if (isWindows) {
+    home = ((await $.env.get('USERPROFILE')) ?? '').replace(/\\/g, '/')
+    const local = ((await $.env.get('LOCALAPPDATA')) ?? '').replace(/\\/g, '/') || `${home}/AppData/Local`
+    desktopApp = `${local}/Buddy/Buddy.exe`
+  } else {
+    home = (await $.env.get('HOME')) ?? ''
+    desktopApp = `${home}/Applications/Buddy.app`
+  }
+  root = home ? `${home}/.claude/buddy` : ''
+}
+
+const native = (path: string) => (isWindows ? path.replace(/\//g, '\\') : path)
+
+// How two spellings of one path compare: Windows ignores case and slash direction.
+const pathKey = (path: string) => (isWindows ? path.replace(/\\/g, '/').toLowerCase() : path)
+
+// Renames a file within a folder. Windows has no mv: cmd's move, run in the folder,
+// so nothing but the two checked file names reaches cmd's command line.
+function moveFile($: Engine, dir: string, from: string, to: string, overwrite: boolean) {
+  if (isWindows) return $.process.run(['cmd', '/c', 'move', '/Y', from, to], { cwd: native(dir) })
+  return $.process.run(overwrite ? ['mv', '-f', `${dir}/${from}`, `${dir}/${to}`] : ['mv', `${dir}/${from}`, `${dir}/${to}`])
+}
+
+function removeFile($: Engine, dir: string, name: string) {
+  if (isWindows) return $.process.run(['cmd', '/c', 'del', '/f', '/q', name], { cwd: native(dir) })
+  return $.process.run(['rm', '-f', `${dir}/${name}`])
+}
+
 async function startBridge($: Engine) {
-  home = (await $.env.get('HOME')) ?? ''
-  if (!home) return
-  root = `${home}/.claude/buddy`
-  await $.process.run(['mkdir', '-p', `${root}/sessions`, `${root}/inbox`, `${root}/outbox`, `${root}/shots`])
+  await locate($)
+  if (!root) return
+  // On Windows the first status write makes .claude/buddy, and the app makes its inbox.
+  if (!isWindows) {
+    await $.process.run(['mkdir', '-p', `${root}/sessions`, `${root}/inbox`, `${root}/outbox`, `${root}/shots`])
+  }
   ticker?.cancel()
   ticker = $.clock.every(1000, () => {
     void tick($)
@@ -236,26 +274,28 @@ async function pollInbox($: Engine) {
   if (isPolling || !root || !sid) return
   isPolling = true
   try {
-    const entries = await $.fs.list(`${root}/inbox`)
+    const inbox = `${root}/inbox`
+    const outbox = `${root}/outbox`
+    const entries = await $.fs.list(inbox)
     for (const entry of entries) {
       if (entry.kind !== 'file' || !entry.name.endsWith('.json')) continue
       const id = entry.name.slice(0, -5)
       if (!SAFE_ID.test(id)) continue
       // Claim it: only one session wins the rename.
-      const claimed = `${root}/inbox/${id}.${sid}.claimed`
-      const moved = await $.process.run(['mv', `${root}/inbox/${entry.name}`, claimed])
+      const claimed = `${id}.${sid}.claimed`
+      const moved = await moveFile($, inbox, entry.name, claimed, false)
       if (moved.exitCode !== 0) continue
       let request: DeskRequest | undefined
       try {
-        request = JSON.parse(await $.fs.read(claimed)) as DeskRequest
+        request = JSON.parse(await $.fs.read(`${inbox}/${claimed}`)) as DeskRequest
       } catch {
         request = undefined
       }
-      await $.process.run(['rm', '-f', claimed])
+      await removeFile($, inbox, claimed)
       if (!request || typeof request !== 'object') continue
       const text = await answerDesk($, id, request)
-      await $.fs.write(`${root}/outbox/${id}.tmp`, JSON.stringify({ id, text }))
-      await $.process.run(['mv', '-f', `${root}/outbox/${id}.tmp`, `${root}/outbox/${id}.json`])
+      await $.fs.write(`${outbox}/${id}.tmp`, JSON.stringify({ id, text }))
+      await moveFile($, outbox, `${id}.tmp`, `${id}.json`, true)
     }
   } finally {
     isPolling = false
@@ -274,7 +314,8 @@ async function answerDesk($: Engine, id: string, request: DeskRequest): Promise<
   const text = typeof request.text === 'string' ? request.text.slice(0, 2000) : ''
   if (request.kind === 'look') {
     const expected = `${root}/shots/${id}.png`
-    if (request.image !== expected || !(await $.fs.exists(expected))) {
+    const image = typeof request.image === 'string' ? request.image : ''
+    if (pathKey(image) !== pathKey(expected) || !(await $.fs.exists(expected))) {
       return "*(I couldn't find the screenshot to look at.)*"
     }
     return peek($, text || 'What do you see on my screen?', expected)
@@ -314,12 +355,12 @@ async function think($: Engine, history: ChatLine[], text: string): Promise<stri
 
 // Spawns Buddy's eyes on one screenshot and waits for what they saw.
 async function peek($: Engine, question: string, path: string): Promise<string> {
-  allowedShots.add(path)
+  allowedShots.add(pathKey(path))
   try {
     const spawned = await $.agent.spawn({
       subagentType: EYES,
       description: 'Buddy looks at your screen',
-      prompt: `Screenshot path: ${path}\nThe user asked: ${question}`,
+      prompt: `Screenshot path: ${native(path)}\nThe user asked: ${question}`,
     })
     if (!('agentId' in spawned) || !spawned.agentId) {
       return `*(My eyes wouldn't open: ${'deny' in spawned ? String(spawned.deny) : 'no reason given'})*`
@@ -343,7 +384,7 @@ async function peek($: Engine, question: string, path: string): Promise<string> 
   } catch (err) {
     return `*(Something went wrong while looking: ${String(err)})*`
   } finally {
-    allowedShots.delete(path)
+    allowedShots.delete(pathKey(path))
   }
 }
 
@@ -376,7 +417,7 @@ export const register: Register = on => {
 
   on('session.end', async ($, e, next) => {
     try {
-      if (root && sid) await $.process.run(['rm', '-f', `${root}/sessions/${sid}.json`])
+      if (root && SAFE_ID.test(sid)) await removeFile($, `${root}/sessions`, `${sid}.json`)
     } catch {
       // the app ignores a stale status after a few seconds anyway
     }
@@ -395,7 +436,7 @@ export const register: Register = on => {
   on('tool.check', async ($, e, next) => {
     if (!e.agentId || !eyesAgents.has(e.agentId)) return next(e)
     const path = (e.input as { file_path?: unknown } | undefined)?.file_path
-    if (e.tool === 'Read' && typeof path === 'string' && allowedShots.has(path)) {
+    if (e.tool === 'Read' && typeof path === 'string' && allowedShots.has(pathKey(path))) {
       return { decision: 'allow', reason: 'Buddy is reading the screenshot it was asked to look at.' }
     }
     return { decision: 'deny', reason: 'Buddy may only read its own screenshot.' }
@@ -403,7 +444,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'buddy' }, async ($, e) => {
     const said = e.args.trim()
-    if (!home) home = (await $.env.get('HOME')) ?? ''
+    await locate($)
     if (said === 'panel') {
       await $.ui.open({ id: PANE, title: TITLE, focus: true })
       return { text: 'Buddy panel opened.' }
@@ -417,15 +458,21 @@ export const register: Register = on => {
       void say($, said)
       return { text: 'Buddy heard you. Check the Buddy panel.' }
     }
-    const app = home ? `${home}/Applications/Buddy.app` : ''
-    if (app && (await $.fs.exists(app))) {
-      const opened = await $.process.run(['open', app])
+    if (home && (await $.fs.exists(desktopApp))) {
+      const opened = isWindows
+        ? await $.process.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', `Start-Process -FilePath '${native(desktopApp).replace(/'/g, "''")}'`])
+        : await $.process.run(['open', desktopApp])
       if (opened.exitCode === 0) {
         return { text: 'Buddy is on your desktop, in the bottom-right corner. Click it to chat, drag it anywhere, right-click for more.' }
       }
     }
     await $.ui.open({ id: PANE, title: TITLE, focus: true })
-    return { text: "Buddy's desktop pet isn't installed yet. Type /buddy:setup and Claude will build it for your Mac (about a minute). Meanwhile, here's the Buddy panel." }
+    const hasDesktopPet = isWindows || (await $.fs.exists('/System/Library/CoreServices'))
+    return {
+      text: hasDesktopPet
+        ? "Buddy's desktop pet isn't installed yet. Type /buddy:setup and Claude will build it for your computer (about a minute). Meanwhile, here's the Buddy panel."
+        : 'The floating pet runs on Mac and Windows. On this computer, Buddy lives in this panel.',
+    }
   })
 
   // ---- live status
@@ -594,28 +641,45 @@ async function say($: Engine, raw: string) {
   }
 }
 
+// Takes the panel's screenshot; resolves what went wrong, in Buddy's words, or undefined.
+async function capture($: Engine, dir: string, path: string): Promise<string | undefined> {
+  if (isWindows) {
+    const shot = await $.process.run(
+      ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', native(`${$.plugin.root}/desktop-windows/capture.ps1`), '-Path', native(path)],
+      { timeoutMs: 20000 },
+    )
+    return shot.exitCode === 0 ? undefined : "I couldn't take a peek at your screen just now. Try again?"
+  }
+  if (!(await $.fs.exists('/usr/sbin/screencapture'))) {
+    return "I can't see the screen on this computer yet. That part works on Mac and Windows."
+  }
+  await $.process.run(['mkdir', '-p', dir])
+  const cap = await $.process.run(['screencapture', '-x', '-C', '-t', 'png', path], { timeoutMs: 15000 })
+  if (cap.exitCode !== 0) {
+    return "I couldn't take a peek. On a Mac, give the Claude app **Screen Recording** permission in System Settings › Privacy & Security, then try again."
+  }
+  await $.process.run(['sips', '-Z', '1600', path], { timeoutMs: 15000 })
+  return undefined
+}
+
 async function look($: Engine, question: string, alreadyAsked = false) {
   if (await read($, isReplying)) return
   if (!alreadyAsked) await update($, chat, list => [...list, { who: 'me', text: question } as ChatLine].slice(-60))
   await update($, isReplying, () => true)
   await update($, mood, () => 'looking' as Mood)
 
-  const path = `${SHOT_DIR}/screen-${await $.clock.now()}.png`
+  await locate($)
+  const dir = isWindows ? `${root}/shots` : SHOT_DIR
+  const name = `screen-${await $.clock.now()}.png`
+  const path = `${dir}/${name}`
   let reply: string
   try {
-    await $.process.run(['mkdir', '-p', SHOT_DIR])
-    const cap = await $.process.run(['screencapture', '-x', '-C', '-t', 'png', path], { timeoutMs: 15000 })
-    if (cap.exitCode !== 0) {
-      reply =
-        "I couldn't take a peek. On a Mac, give the Claude app **Screen Recording** permission in System Settings › Privacy & Security, then try again."
-    } else {
-      await $.process.run(['sips', '-Z', '1600', path], { timeoutMs: 15000 })
-      reply = await peek($, question, path)
-    }
+    const problem = await capture($, dir, path)
+    reply = problem ?? (await peek($, question, path))
   } catch (err) {
     reply = `*(Something went wrong while looking: ${String(err)})*`
   } finally {
-    void $.process.run(['rm', '-f', path]).catch(() => undefined)
+    void removeFile($, dir, name).catch(() => undefined)
   }
   await update($, chat, list => [...list, { who: 'buddy', text: reply } as ChatLine].slice(-60))
   await settle($)

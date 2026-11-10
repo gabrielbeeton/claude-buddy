@@ -1,0 +1,110 @@
+# Builds Buddy's Windows desktop pet on a real Windows machine and tries it out:
+# first on its own, then talking to a real Claude Code session that has the Buddy mod.
+# No account is needed: the session talks to desktop-windows/test/fake-api.mjs.
+name: Windows
+
+on:
+  push:
+    branches: [main, windows-support]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop-pet:
+    name: Desktop pet
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sources are plain ASCII
+        shell: bash
+        run: python desktop-windows/test/ascii.py && git diff --exit-code -- desktop-windows
+
+      - name: Build Buddy.exe with the compiler that ships in Windows
+        shell: bash
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File desktop-windows/build.ps1
+
+      - name: Try it on a real desktop
+        shell: bash
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File desktop-windows/test/smoke.ps1 -Out artifacts/desktop
+
+      - name: Screen capture script (the Buddy panel's look)
+        shell: bash
+        run: |
+          powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File desktop-windows/capture.ps1 -Path artifacts/desktop/capture-script.png
+          test -s artifacts/desktop/capture-script.png
+
+      - name: Install, update and quit, the way /buddy:setup does
+        shell: powershell
+        run: |
+          $target = Join-Path $env:LOCALAPPDATA 'Buddy\Buddy.exe'
+          powershell -NoProfile -ExecutionPolicy Bypass -File desktop-windows\build.ps1 -Install
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Start-Sleep -Seconds 3
+          $first = @(Get-Process -Name Buddy -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $target })
+          if ($first.Count -ne 1) { Write-Host 'Buddy is not running after the install.'; exit 1 }
+          powershell -NoProfile -ExecutionPolicy Bypass -File desktop-windows\build.ps1 -Install
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Start-Sleep -Seconds 3
+          $second = @(Get-Process -Name Buddy -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $target })
+          if ($second.Count -ne 1 -or $second[0].Id -eq $first[0].Id) { Write-Host 'The update did not replace the running Buddy.'; exit 1 }
+          Set-Content -Path (Join-Path $env:USERPROFILE '.claude\buddy\quit') -Value 'bye' -Encoding ASCII
+          if (-not $second[0].WaitForExit(8000)) { Write-Host 'Buddy did not quit.'; exit 1 }
+          $log = Join-Path $env:USERPROFILE '.claude\buddy\desktop-log.txt'
+          if (Test-Path $log) { Get-Content $log; exit 1 }
+          Write-Host 'Installed, updated and quit cleanly.'
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-pet
+          path: artifacts
+          if-no-files-found: ignore
+
+  with-claude-code:
+    name: With real Claude Code
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Claude Code
+        shell: bash
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: The plugin is valid
+        shell: bash
+        run: claude plugin validate .
+
+      - name: Mod tests
+        shell: bash
+        run: claude plugin test .
+
+      - name: The mod in a real session
+        shell: bash
+        run: node desktop-windows/test/e2e-bridge.mjs
+
+      - name: Build Buddy.exe
+        shell: bash
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File desktop-windows/build.ps1
+
+      - name: The desktop pet talking to a real session
+        shell: bash
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File desktop-windows/test/smoke.ps1 -Out artifacts/live -Live
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: with-claude-code
+          path: artifacts
+          if-no-files-found: ignore
